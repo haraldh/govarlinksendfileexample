@@ -1,0 +1,16 @@
+interface com.example.sendfile
+
+type FileAttributes (
+    size: int
+)
+
+# Connection goes into upgraded mode afterwards
+# and expects the binary data to be sent
+method SendFile(type: string, length: int) -> (file_handle: string)
+
+method DeleteFile(file_handle: string) -> ()
+method LsFile(file_handle: string) -> (attr : FileAttributes)
+
+error ErrorFileTooBig ()
+error ErrorFileCreate ()
+error ErrorInvalidFileHandle ()
