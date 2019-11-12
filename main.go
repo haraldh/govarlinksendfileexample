@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"github.com/haraldh/govarlinksendfileexample/comexamplesendfile"
@@ -27,7 +28,7 @@ func checkFileHandle(handle string) (err error) {
 	return
 }
 
-func (m *server) SendFile(c comexamplesendfile.VarlinkCall, type_ string, length int64) (err error) {
+func (m *server) SendFile(ctx context.Context, c comexamplesendfile.VarlinkCall, type_ string, length int64) (err error) {
 
 	if !c.WantsUpgrade() {
 		err = fmt.Errorf("Client did not set Upgrade for SendFile")
@@ -35,7 +36,7 @@ func (m *server) SendFile(c comexamplesendfile.VarlinkCall, type_ string, length
 	}
 
 	if length > 10000000 {
-		err = c.ReplyErrorFileTooBig()
+		err = c.ReplyErrorFileTooBig(ctx)
 		return
 	}
 
@@ -44,11 +45,11 @@ func (m *server) SendFile(c comexamplesendfile.VarlinkCall, type_ string, length
 
 	if err != nil {
 		fmt.Printf("Error: TempDir() %v\n", err)
-		err = c.ReplyErrorFileCreate()
+		err = c.ReplyErrorFileCreate(ctx)
 		return
 	}
 
-	if err = c.ReplySendFile(path.Base(file_handle)); err != nil {
+	if err = c.ReplySendFile(ctx, path.Base(file_handle)); err != nil {
 		return
 	}
 
@@ -75,7 +76,7 @@ func (m *server) SendFile(c comexamplesendfile.VarlinkCall, type_ string, length
 			buf = make([]byte, toBeCopied)
 		}
 
-		numBytesRead, err := c.Call.Reader.Read(buf)
+		numBytesRead, err := c.Conn.Read(ctx, buf)
 
 		if numBytesRead == toBeCopied {
 			err = nil
@@ -116,24 +117,25 @@ func (m *server) SendFile(c comexamplesendfile.VarlinkCall, type_ string, length
 		return
 	}
 
+	buf = make([]byte, 1)
+	buf[0] = 0xa
 	// Send an ACK to the client
-	c.Call.Writer.WriteByte(0)
-	c.Call.Writer.Flush()
+	c.Call.Conn.Write(ctx, buf)
 
 	// Connection is upgraded and cannot be used for the varlink protocol anymore
 	// Close the connection
 	return fmt.Errorf("SendFile done")
 }
 
-func (m *server) DeleteFile(c comexamplesendfile.VarlinkCall, file_handle string) (err error) {
+func (m *server) DeleteFile(ctx context.Context, c comexamplesendfile.VarlinkCall, file_handle string) (err error) {
 
 	if err = checkFileHandle(file_handle); err != nil {
-		err = c.ReplyErrorInvalidFileHandle()
+		err = c.ReplyErrorInvalidFileHandle(ctx)
 		return
 	}
 
 	if _, err = os.Stat(path.Join(m.cacheDir, file_handle)); err != nil {
-		err = c.ReplyErrorInvalidFileHandle()
+		err = c.ReplyErrorInvalidFileHandle(ctx)
 		return
 	}
 
@@ -142,13 +144,13 @@ func (m *server) DeleteFile(c comexamplesendfile.VarlinkCall, file_handle string
 		return
 	}
 
-	err = c.ReplyDeleteFile()
+	err = c.ReplyDeleteFile(ctx)
 	return
 }
 
-func (m *server) LsFile(c comexamplesendfile.VarlinkCall, file_handle string) (err error) {
+func (m *server) LsFile(ctx context.Context, c comexamplesendfile.VarlinkCall, file_handle string) (err error) {
 	if err = checkFileHandle(file_handle); err != nil {
-		err = c.ReplyErrorInvalidFileHandle()
+		err = c.ReplyErrorInvalidFileHandle(ctx)
 		return
 	}
 
@@ -164,7 +166,7 @@ func (m *server) LsFile(c comexamplesendfile.VarlinkCall, file_handle string) (e
 		return
 	}
 
-	err = c.ReplyLsFile(comexamplesendfile.FileAttributes{Size: fi.Size()})
+	err = c.ReplyLsFile(ctx, comexamplesendfile.FileAttributes{Size: fi.Size()})
 	return
 }
 
@@ -205,7 +207,10 @@ func run_server(address string) (err error) {
 		return
 	}
 
-	err = service.Listen(address, time.Duration(60)*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = service.Listen(ctx, address, time.Duration(60)*time.Second)
 
 	return
 }
@@ -221,9 +226,12 @@ func run_client(address string, filename string) (err error) {
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var c *varlink.Connection
 
-	c, err = varlink.NewConnection(address)
+	c, err = varlink.NewConnection(ctx, address)
 	if err != nil {
 		fmt.Println("Failed to connect")
 		return
@@ -231,12 +239,12 @@ func run_client(address string, filename string) (err error) {
 	defer c.Close()
 
 	// We have to use Send() to send the varlink.Upgrade flag
-	receive, err := comexamplesendfile.SendFile().Send(c, varlink.Upgrade, "file", int64(fi.Size()))
+	receive, err := comexamplesendfile.SendFile().Upgrade(ctx, c, "file", int64(fi.Size()))
 	if err != nil {
 		fmt.Println("SendFile() call failed")
 		return
 	}
-	file_handle, _, err := receive()
+	file_handle, _, rw_cont, err := receive(ctx)
 	if err != nil {
 		fmt.Println("SendFile() call failed")
 		return
@@ -248,43 +256,50 @@ func run_client(address string, filename string) (err error) {
 	// and we talk our own protocol
 
 	reader := bufio.NewReader(fs)
-	_, err = reader.WriteTo(c.Writer)
-	if err != nil {
-		fmt.Println("WriteTo() failed")
-		return
+	buf := make([]byte, 2048)
+	for {
+		n, r_err := reader.Read(buf)
+		if r_err != nil || n == 0 {
+			break
+		}
+		_, w_err := rw_cont.Write(ctx, buf)
+		if w_err != nil {
+			fmt.Println("WriteTo() failed")
+			return
+		}
 	}
-	c.Writer.Flush()
 
+	buf = make([]byte, 1)
 	// All was sent, wait for the ACK from the server
-	b, err := c.Reader.ReadByte()
+	b, err := rw_cont.Read(ctx, buf)
 	if b != 0 {
-		fmt.Println("Ret from Server: %x", int(b))
+		fmt.Printf("Ret from Server: %v\n", buf)
 	}
 
 	// Because the connection is upgraded, we cannot reuse the connection for the varlink
 	// protocol anymore. Close it and reopen the connection.
 	c.Close()
-	c, err = varlink.NewConnection(address)
+	c, err = varlink.NewConnection(ctx, address)
 	if err != nil {
 		fmt.Println("Failed to connect again")
 		return
 	}
 
-	stat, err := comexamplesendfile.LsFile().Call(c, file_handle)
+	stat, err := comexamplesendfile.LsFile().Call(ctx, c, file_handle)
 	if err != nil {
 		fmt.Println("LsFile() failed")
 		return
 	}
 	fmt.Printf("Got FileAttributes: Size=%v\n", stat.Size)
 
-	err = comexamplesendfile.DeleteFile().Call(c, file_handle)
+	err = comexamplesendfile.DeleteFile().Call(ctx, c, file_handle)
 	if err != nil {
 		fmt.Println("DeleteFile() failed")
 		return
 	}
 	fmt.Printf("Removed %v\n", file_handle)
 
-	err = comexamplesendfile.DeleteFile().Call(c, file_handle)
+	err = comexamplesendfile.DeleteFile().Call(ctx, c, file_handle)
 	if err != nil {
 		switch err.(type) {
 		case *comexamplesendfile.ErrorInvalidFileHandle:
