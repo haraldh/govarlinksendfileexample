@@ -118,7 +118,7 @@ func (m *server) SendFile(ctx context.Context, c comexamplesendfile.VarlinkCall,
 	}
 
 	buf = make([]byte, 1)
-	buf[0] = 0xa
+	buf[0] = 0
 	// Send an ACK to the client
 	c.Call.Conn.Write(ctx, buf)
 
@@ -269,12 +269,9 @@ func run_client(address string, filename string) (err error) {
 		}
 	}
 
-	buf = make([]byte, 1)
 	// All was sent, wait for the ACK from the server
-	b, err := rw_cont.Read(ctx, buf)
-	if b != 0 {
-		fmt.Printf("Ret from Server: %v\n", buf)
-	}
+	b, err := rw_cont.ReadBytes(ctx, 0)
+	fmt.Printf("Ret from Server: %v\n", b)
 
 	// Because the connection is upgraded, we cannot reuse the connection for the varlink
 	// protocol anymore. Close it and reopen the connection.
